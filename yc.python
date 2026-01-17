@@ -1,0 +1,188 @@
+import asyncio
+import aiohttp
+import pandas as pd
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+import time
+from urllib.parse import urljoin
+
+# --- CONFIGURATION ---
+BASE_URL = "https://www.ycombinator.com/companies"
+TARGET_COUNT = 500  # Number of startups to scrape
+CONCURRENCY_LIMIT = 20  # Max concurrent requests for detail pages
+
+async def get_company_urls(target_count):
+    """scrapes company URLs using href patterns instead of dynamic CSS classes."""
+
+    companies = []
+    seen_urls = set()
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        
+        print(f" Navigating to {BASE_URL}...")
+        await page.goto(BASE_URL)
+        
+        # Wait for the list to actually load (timeout safety)
+        try:
+            await page.wait_for_selector('a[href^="/companies/"]', timeout=15000)
+        except Exception:
+            print("⚠️ Timed out waiting for initial company list.")
+
+        previous_height = 0
+        no_change_counter = 0
+
+        while len(companies) < target_count:
+            # 1. Extract data using JavaScript (Much faster than looping in Python)
+            # We grab all links that look like company profiles
+            page_data = await page.evaluate("""() => {
+                const anchors = Array.from(document.querySelectorAll('a[href^="/companies/"]'));
+                return anchors.map(a => ({
+                    href: a.getAttribute('href'),
+                    text: a.innerText
+                }));
+            }""")
+
+            # 2. Process and Filter Data in Python
+            for item in page_data:
+                href = item['href']
+                # Valid profile links usually have exactly 2 slashes: /companies/airbnb
+                # We exclude /companies (1 slash) and query params like ?batch= (handled by split)
+                clean_path = href.split('?')[0]
+                
+                if clean_path.count('/') == 2 and clean_path != "/companies":
+                    full_url = urljoin(BASE_URL, href)
+                    
+                    if full_url not in seen_urls:
+                        seen_urls.add(full_url)
+                        # Clean up the name (remove extra whitespace/newlines)
+                        name = item['text'].split('\n')[0].strip()
+                        companies.append({
+                            "url": full_url,
+                            "list_name": name if name else "N/A"
+                        })
+
+            print(f" Detected {len(companies)} unique Startup companies so far...")
+            
+            if len(companies) >= target_count:
+                break
+            
+            # 3. Scroll and Wait
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(2000) # Give network time to fetch more
+            
+            # 4. Check for end of list
+            new_height = await page.evaluate("document.body.scrollHeight")
+            if new_height == previous_height:
+                no_change_counter += 1
+                if no_change_counter >= 3: # Retry scrolling a few times before quitting
+                    print(" End of list or scroll stuck.")
+                    break
+            else:
+                no_change_counter = 0
+                
+            previous_height = new_height
+
+        await browser.close()
+        
+    print(f"🎉 Successfully collected {len(companies)} company URLs.")
+    return companies[:target_count]
+
+async def fetch_detail_page(session, company_data):
+    """
+    Fetches a single company detail page and extracts founder info.
+    """
+    url = company_data['url']
+    try:
+        async with session.get(url) as response:
+            if response.status != 200:
+                return company_data
+            
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # --- Extract Data ---
+            
+            # 1. Company Name (Header)
+            name_tag = soup.find('h1')
+            company_data['Company Name'] = name_tag.get_text(strip=True) if name_tag else company_data.get('list_name', 'N/A')
+            
+            # 2. Short Description
+            # Usually in a meta tag or a specific div
+            desc_tag = soup.find('div', class_='text-xl') # Common class for description on YC
+            company_data['Short Description'] = desc_tag.get_text(strip=True) if desc_tag else "N/A"
+            
+            # 3. Batch (Often found in a pill/badge near the top)
+            # Look for links like /companies?batch=...
+            batch_link = soup.find('a', href=lambda x: x and 'batch=' in x)
+            company_data['Batch'] = batch_link.get_text(strip=True) if batch_link else "N/A"
+            
+            # 4. Founders
+            founders = []
+            linkedin_urls = []
+            
+            # Strategy: Find links to LinkedIn within the page body
+            all_linkedin_links = soup.find_all('a', href=lambda x: x and 'linkedin.com/in' in x)
+            
+            for link in all_linkedin_links:
+                l_url = link['href']
+                # The name is often the text of the link, or the parent div's text
+                # Check if it's a founder link (usually inside a founder card)
+                founder_card = link.find_parent('div', class_='flex-row') or link.find_parent('div')
+                if founder_card:
+                    # Extract text and clean it
+                    f_name = founder_card.get_text(strip=True).replace("LinkedIn", "").strip()
+                    # Basic validation to avoid capturing long paragraphs
+                    if len(f_name) < 50: 
+                        founders.append(f_name)
+                        linkedin_urls.append(l_url)
+            
+            company_data['Founder Name(s)'] = ", ".join(list(set(founders))) if founders else "N/A"
+            company_data['Founder LinkedIn URL(s)'] = ", ".join(list(set(linkedin_urls))) if linkedin_urls else "N/A"
+            
+            # Cleanup temp keys
+            if 'list_name' in company_data: del company_data['list_name']
+            if 'url' in company_data: del company_data['url'] 
+            
+            return company_data
+
+    except Exception as e:
+        print(f" Error scraping {url}: {e}")
+        return company_data
+
+async def main():
+    # Step 1: Get the list of links (Dynamic Scraping)
+    company_list = await get_company_urls(TARGET_COUNT)
+    
+    # Step 2: Enrich with details (Concurrent Requests)
+    print("Starting enrichment of company details...")
+    enriched_data = []
+    
+    connector = aiohttp.TCPConnector(limit=CONCURRENCY_LIMIT)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [fetch_detail_page(session, company) for company in company_list]
+        
+        # Use simple print for progress
+        for i, f in enumerate(asyncio.as_completed(tasks)):
+            result = await f
+            enriched_data.append(result)
+            if (i + 1) % 50 == 0:
+                print(f" Processed {i + 1}/{len(company_list)} profiles...")
+
+    # Step 3: Save to CSV
+    df = pd.DataFrame(enriched_data)
+    
+    # Reorder columns for cleanliness
+    cols = ['Company Name', 'Batch', 'Short Description', 'Founder Name(s)', 'Founder LinkedIn URL(s)']
+    # Ensure all cols exist
+    for c in cols:
+        if c not in df.columns: df[c] = "N/A"
+        
+    df = df[cols]
+    filename = "yc_startups_500.csv"
+    df.to_csv(filename, index=False)
+    print(f"✅ Scraping completed! Saved data to {filename}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
